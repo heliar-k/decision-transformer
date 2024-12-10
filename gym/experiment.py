@@ -68,6 +68,7 @@ def experiment(
     # load dataset
     dataset_path = f'data/{env_name}-{dataset}-v2.pkl'
     with open(dataset_path, 'rb') as f:
+        # trajectories的形式不确定
         trajectories = pickle.load(f)
 
     # save all path information into separate lists
@@ -95,17 +96,20 @@ def experiment(
     print(f'Max return: {np.max(returns):.2f}, min: {np.min(returns):.2f}')
     print('=' * 50)
 
+    # K 估计是模型可以输入的最长序列
+    # 这个值用ROPE是不是可以设置为无穷大？
     K = variant['K']
     batch_size = variant['batch_size']
     num_eval_episodes = variant['num_eval_episodes']
-    pct_traj = variant.get('pct_traj', 1.)
+    pct_traj = variant.get('pct_traj', 1.) # 控制训练数据采样量
 
     # only train on top pct_traj trajectories (for %BC experiment)
     num_timesteps = max(int(pct_traj*num_timesteps), 1)
     sorted_inds = np.argsort(returns)  # lowest to highest
     num_trajectories = 1
     timesteps = traj_lens[sorted_inds[-1]]
-    ind = len(trajectories) - 2
+    ind = len(trajectories) - 2 # 从倒数第二个开始
+    # 根据num_timesteps来确定采样的轨迹数
     while ind >= 0 and timesteps + traj_lens[sorted_inds[ind]] <= num_timesteps:
         timesteps += traj_lens[sorted_inds[ind]]
         num_trajectories += 1
@@ -113,22 +117,27 @@ def experiment(
     sorted_inds = sorted_inds[-num_trajectories:]
 
     # used to reweight sampling so we sample according to timesteps instead of trajectories
+    # 根据每条样本轨迹的长度来确定采样概率
     p_sample = traj_lens[sorted_inds] / sum(traj_lens[sorted_inds])
 
     def get_batch(batch_size=256, max_len=K):
         batch_inds = np.random.choice(
             np.arange(num_trajectories),
-            size=batch_size,
+            size=batch_size, # one trajectory is one element in batch, so here is the number of trajectories
             replace=True,
             p=p_sample,  # reweights so we sample according to timesteps
         )
 
         s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []
         for i in range(batch_size):
+            # 取出一个轨迹
             traj = trajectories[int(sorted_inds[batch_inds[i]])]
+            # 随机选择一个起始点(start_index)？ 
+            # 因为reward的shape时一维的, 所以这儿等价为 random.randint(0, len(traj)-1)
             si = random.randint(0, traj['rewards'].shape[0] - 1)
 
             # get sequences from dataset
+            # 此处即使si+max_len超过了轨迹长度，也不会报错
             s.append(traj['observations'][si:si + max_len].reshape(1, -1, state_dim))
             a.append(traj['actions'][si:si + max_len].reshape(1, -1, act_dim))
             r.append(traj['rewards'][si:si + max_len].reshape(1, -1, 1))
@@ -136,7 +145,12 @@ def experiment(
                 d.append(traj['terminals'][si:si + max_len].reshape(1, -1))
             else:
                 d.append(traj['dones'][si:si + max_len].reshape(1, -1))
+            # s[-1] 就是当前循环刚刚加入的observation序列, 第二维是时间步? 
+            # 感觉timesteps是[si, min(si+max_len, len(traj))]
             timesteps.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))
+            # 把大于等于max_ep_len的时间步设置为max_ep_len-1
+            # 如 timestep = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], max_ep_len=10
+            # 则 cutoff后的timestep = [5, 6, 7, 8, 9, 9, 9, 9, 9, 9]
             timesteps[-1][timesteps[-1] >= max_ep_len] = max_ep_len-1  # padding cutoff
             rtg.append(discount_cumsum(traj['rewards'][si:], gamma=1.)[:s[-1].shape[1] + 1].reshape(1, -1, 1))
             if rtg[-1].shape[1] <= s[-1].shape[1]:
